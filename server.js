@@ -225,7 +225,7 @@ app.post("/withdraw", auth, async (req, res) => {
     const amount = Number(user.wallet);
 
     if (Number(amount) < 10.00)
-      return res.json({ success: false, msg: "Minimum withdraw ₹0.80 required" });
+      return res.json({ success: false, msg: "Minimum withdraw ₹10.00 required" });
 
     if (!upi)
       return res.json({ success: false, msg: "UPI ID required" });
