@@ -1,4 +1,5 @@
 import express from "express";
+import fs from "fs";
 import path from "path";
 import cors from "cors";
 import Razorpay from "razorpay";
@@ -7,19 +8,17 @@ import jwt from "jsonwebtoken";
 import axios from "axios";
 import { fileURLToPath } from "url";
 
-import db from "./firebase.js";
-import { ref, get, set, update } from "firebase/database";
-
 const _filename = fileURLToPath(import.meta.url);
 const _dirname = path.dirname(_filename);
+
 
 const app = express();
 app.use(express.json());
 app.use(cors());
-app.use(express.static(path.join(_dirname, "..", "public")));
+app.use(express.static(path.join(_dirname, '..', 'public')));
 
-app.get("/", (req, res) => {
-  res.sendFile(path.join(_dirname, "..", "public", "index.html"));
+app.get('/', (req, res) => {
+  res.sendFile(path.join(_dirname, '..', 'public', 'index.html'));
 });
 
 // ---------------- Razorpay ----------------
@@ -31,8 +30,27 @@ const razor = new Razorpay({
 // JWT
 const SECRET = "SUPERSECRETKEY";
 
+// DB File
+const DATA_FILE = path.join(_dirname, "data.json");
+
+function loadDB() {
+  if (!fs.existsSync(DATA_FILE)) {
+    fs.writeFileSync(
+      DATA_FILE,
+      JSON.stringify({ counter: 0, users: {} }, null, 2)
+    );
+  }
+  return JSON.parse(fs.readFileSync(DATA_FILE));
+}
+
+function saveDB(db) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+}
+
+
 // ---------------- Coupon Logic ----------------
 function calculateCoupon(counter, captchaCorrect) {
+
   if (counter >= 100000000) {
     return { coupon: 0, reset: true };
   }
@@ -46,13 +64,18 @@ function calculateCoupon(counter, captchaCorrect) {
     10000000: 350000
   };
 
+  // Captcha correct
   if (captchaCorrect) {
-    if (milestones[counter]) return { coupon: milestones[counter], reset: false };
+    if (milestones[counter]) {
+      return { coupon: milestones[counter], reset: false };
+    }
     return { coupon: 0.40, reset: false };
   }
 
+  // Captcha wrong
   return { coupon: 0.30, reset: false };
 }
+
 
 // ---------------- Middleware ----------------
 function auth(req, res, next) {
@@ -67,37 +90,33 @@ function auth(req, res, next) {
   }
 }
 
+
 // ---------------- Signup ----------------
 app.post("/signup", async (req, res) => {
   try {
     const { name, mobile, password } = req.body;
+    let db = loadDB();
 
-    const userRef = ref(db, "users/" + mobile);
-    const snap = await get(userRef);
-
-    if (snap.exists())
+    if (!db.users) db.users = {};
+    if (db.users[mobile])
       return res.json({ success: false, msg: "Mobile already exists" });
 
-    await set(userRef, { name, password, wallet: 0 });
+    db.users[mobile] = { name, password, wallet: 0 };
+    saveDB(db);
 
     res.json({ success: true, msg: "Signup successful" });
-  } catch (err) {
+  } catch {
     res.json({ success: false, msg: "Signup failed" });
   }
 });
 
+
 // ---------------- Login ----------------
-app.post("/login", async (req, res) => {
+app.post("/login", (req, res) => {
   const { mobile, password } = req.body;
+  let db = loadDB();
 
-  const userRef = ref(db, "users/" + mobile);
-  const snap = await get(userRef);
-
-  if (!snap.exists()) return res.json({ success: false, msg: "Invalid login" });
-
-  const user = snap.val();
-
-  if (user.password !== password)
+  if (!db.users[mobile] || db.users[mobile].password !== password)
     return res.json({ success: false, msg: "Invalid login" });
 
   const token = jwt.sign({ mobile }, SECRET);
@@ -106,24 +125,23 @@ app.post("/login", async (req, res) => {
     success: true,
     msg: "Login successful",
     token,
-    user: { mobile, name: user.name }
+    user: { mobile, name: db.users[mobile].name }
   });
 });
 
-// ---------------- Get User (Wallet) ----------------
-app.post("/get-user", auth, async (req, res) => {
-  const userRef = ref(db, "users/" + req.user.mobile);
-  const userSnap = await get(userRef);
 
-  const counterSnap = await get(ref(db, "counter"));
-  const counter = counterSnap.exists() ? counterSnap.val() : 0;
+// ---------------- Get User (Wallet) ----------------
+app.post("/get-user", auth, (req, res) => {
+  let db = loadDB();
+  const user = db.users[req.user.mobile];
 
   res.json({
     success: true,
-    wallet: userSnap.val().wallet,
-    counter
+    wallet: user.wallet,
+    counter: db.counter
   });
 });
+
 
 // ---------------- PAY ₹1 ----------------
 app.post("/pay1", auth, async (req, res) => {
@@ -140,69 +158,70 @@ app.post("/pay1", auth, async (req, res) => {
       id: order.id,
       amount: order.amount
     });
+
   } catch (err) {
     console.error("Pay1 Error:", err);
     res.json({ success: false, msg: "Order creation failed" });
   }
 });
 
+
 // ---------------- Captcha Page ----------------
 app.get("/after-payment", (req, res) => {
-  res.sendFile(path.join(_dirname, "..", "public", "captcha.html"));
+  res.sendFile(path.join(__dirname, "..", "public", "captcha.html"));
 });
+
 
 // ---------------- VERIFY PAYMENT + CAPTCHA + REWARD ----------------
-app.post("/verify", auth, async (req, res) => {
-  const { orderId, paymentId, signature, captchaStatus } = req.body;
+app.post('/verify', auth, async (req, res) => {
+    const { orderId, paymentId, signature, captchaStatus } = req.body;
 
-  try {
-    const expected_signature = crypto
-      .createHmac("sha256", razor.key_secret)
-      .update(orderId + "|" + paymentId)
-      .digest("hex");
+    try {
+        // 1. Verify signature
+        const expected_signature = crypto.createHmac("sha256", razor.key_secret)
+            .update(orderId + "|" + paymentId)
+            .digest("hex");
 
-    if (expected_signature !== signature)
-      return res.json({ success: false, msg: "Invalid signature" });
+        if (expected_signature !== signature) {
+            return res.json({ success: false, msg: "Invalid signature" });
+        }
 
-    const payment = await razor.payments.fetch(paymentId);
-    if (!payment || payment.status !== "captured")
-      return res.json({ success: false, msg: "Payment not captured" });
+        // 2. Fetch payment status from Razorpay
+        const payment = await razor.payments.fetch(paymentId);
+        if (!payment || payment.status !== "captured") {
+            return res.json({ success: false, msg: "Payment not captured" });
+        }
 
-    // Counter update
-    let counterSnap = await get(ref(db, "counter"));
-    let counter = counterSnap.exists() ? counterSnap.val() + 1 : 1;
+        // 3. Update DB & apply reward
+        let db = loadDB();
+        db.counter = db.counter ? db.counter + 1 : 1;
 
-    const coupon = calculateCoupon(counter, captchaStatus);
+        const couponResult = calculateCoupon(db.counter, captchaStatus);
+        db.users[req.user.mobile].wallet += couponResult.coupon;
 
-    const userRef = ref(db, "users/" + req.user.mobile);
-    const userSnap = await get(userRef);
+        if (couponResult.reset) db.counter = 0; // reset counter if milestone reached
+        saveDB(db);
 
-    const newWallet = userSnap.val().wallet + coupon.coupon;
+        res.json({
+            success: true,
+            msg: "Payment verified successfully",
+            prize: couponResult.coupon,
+            wallet: db.users[req.user.mobile].wallet
+        });
 
-    await update(userRef, { wallet: newWallet });
-    await set(ref(db, "counter"), counter);
-
-    res.json({
-      success: true,
-      msg: "Payment verified successfully",
-      prize: coupon.coupon,
-      wallet: newWallet
-    });
-  } catch (err) {
-    console.error("Verify Error:", err);
-    res.json({ success: false, msg: "Server error verifying payment" });
-  }
+    } catch (err) {
+        console.error("Verify Error:", err);
+        res.json({ success: false, msg: "Server error verifying payment" });
+    }
 });
+
 
 // ---------------- Withdraw ----------------
 app.post("/withdraw", auth, async (req, res) => {
   try {
     const { upi } = req.body;
-
-    const userRef = ref(db, "users/" + req.user.mobile);
-    const userSnap = await get(userRef);
-
-    const user = userSnap.val();
+    let db = loadDB();
+    const user = db.users[req.user.mobile];
     const amount = user.wallet;
 
     if (amount < 10.0)
@@ -211,7 +230,7 @@ app.post("/withdraw", auth, async (req, res) => {
     if (!upi)
       return res.json({ success: false, msg: "UPI ID required" });
 
-    // RazorpayX process
+    // Withdraw (RazorpayX)
     const contact = await axios.post(
       "https://api.razorpay.com/v1/contacts",
       {
@@ -236,7 +255,7 @@ app.post("/withdraw", auth, async (req, res) => {
     const payout = await axios.post(
       "https://api.razorpay.com/v1/payouts",
       {
-        account_number: "12345678901234",
+        account_number: "YOUR_RAZORPAYX_VIRTUAL_ACCOUNT",
         fund_account_id: fundAcc.data.id,
         amount: amount * 100,
         currency: "INR",
@@ -246,18 +265,17 @@ app.post("/withdraw", auth, async (req, res) => {
       { auth: { username: razor.key_id, password: razor.key_secret } }
     );
 
-    await update(userRef, { wallet: 0 });
+    user.wallet = 0;
+    saveDB(db);
 
-    res.json({
-      success: true,
-      msg: "Withdrawal initiated!",
-      payout_id: payout.data.id
-    });
+    res.json({ success: true, msg: "Withdrawal initiated!", payout_id: payout.data.id });
+
   } catch (err) {
     console.log(err.response?.data || err);
     res.json({ success: false, msg: "Withdrawal failed" });
   }
 });
+
 
 // ---------------- Start Server ----------------
 app.listen(5000, () => console.log("Server running on 5000"));
