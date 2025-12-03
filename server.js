@@ -168,7 +168,7 @@ app.post("/pay1", auth, async (req, res) => {
 
 // ---------------- Captcha Page ----------------
 app.get("/after-payment", (req, res) => {
-  res.sendFile(path.join(__dirname, "..", "public", "captcha.html"));
+  res.sendFile(path.join(_dirname, "..", "public", "captcha.html"));
 });
 
 
@@ -222,9 +222,9 @@ app.post("/withdraw", auth, async (req, res) => {
     const { upi } = req.body;
     let db = loadDB();
     const user = db.users[req.user.mobile];
-    const amount = user.wallet;
+    const amount = Number(user.wallet);
 
-    if (amount < 10.0)
+    if (Number(amount) < 10.00)
       return res.json({ success: false, msg: "Minimum withdraw ₹0.80 required" });
 
     if (!upi)
