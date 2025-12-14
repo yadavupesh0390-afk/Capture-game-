@@ -1,281 +1,109 @@
-import express from "express";
-import fs from "fs";
-import path from "path";
-import cors from "cors";
-import Razorpay from "razorpay";
-import crypto from "crypto";
-import jwt from "jsonwebtoken";
-import axios from "axios";
-import { fileURLToPath } from "url";
-
-const _filename = fileURLToPath(import.meta.url);
-const _dirname = path.dirname(_filename);
-
+// ================== server.js ==================
+const express = require('express');
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
 
 const app = express();
-app.use(express.json());
-app.use(cors());
-app.use(express.static(path.join(_dirname, '..', 'public')));
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = "sabkasathi_secret"; // Secret for JWT
 
-app.get('/', (req, res) => {
-  res.sendFile(path.join(_dirname, '..', 'public', 'index.html'));
+// ===== MIDDLEWARE =====
+app.use(cors()); // Enable cross-origin requests
+app.use(express.json()); // Parse JSON bodies
+
+// ===== MONGODB =====
+// Use your Atlas connection string here
+const MONGO_URI = "mongodb+srv://yadavupesh39_db_user:SHJAjSJTIUfPiWyk@cluster0.uapmdte.mongodb.net/sabka_sathi?retryWrites=true&w=majority";
+mongoose.connect(MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+}).then(()=>console.log("MongoDB connected ✅"))
+  .catch(err=>console.error("MongoDB connection error:", err));
+
+// ===== SCHEMA =====
+const userSchema = new mongoose.Schema({
+  name: {type: String, required: true},
+  mobile: {type: String, required: true},
+  password: {type: String, required: true},
+  role: {type: String, required: true},
+  extra: {type: Object, default: {}}
 });
 
-// ---------------- Razorpay ----------------
-const razor = new Razorpay({
-  key_id: "rzp_live_z5X8cFJEBrqXF9",
-  key_secret: "I1uUH50qsq29gPFTosFecZqP"
-});
+const User = mongoose.model('User', userSchema);
 
-// JWT
-const SECRET = "SUPERSECRETKEY";
+// ===== SIGNUP =====
+app.post('/api/signup', async (req, res) => {
+  try {
+    const {name, mobile, password, role, ...rest} = req.body;
 
-// DB File
-const DATA_FILE = path.join(_dirname, "data.json");
-
-function loadDB() {
-  if (!fs.existsSync(DATA_FILE)) {
-    fs.writeFileSync(
-      DATA_FILE,
-      JSON.stringify({ counter: 0, users: {} }, null, 2)
-    );
-  }
-  return JSON.parse(fs.readFileSync(DATA_FILE));
-}
-
-function saveDB(db) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
-}
-
-
-// ---------------- Coupon Logic ----------------
-function calculateCoupon(counter, captchaCorrect) {
-
-  if (counter >= 100000000) {
-    return { coupon: 0, reset: true };
-  }
-
-  const milestones = {
-    100: 10,
-    1000: 100,
-    10000: 1000,
-    100000: 10000,
-    1000000: 100000,
-    10000000: 350000
-  };
-
-  // Captcha correct
-  if (captchaCorrect) {
-    if (milestones[counter]) {
-      return { coupon: milestones[counter], reset: false };
+    if(!name || !mobile || !password || !role) {
+      return res.status(400).json({success:false,message:"Missing required fields"});
     }
-    return { coupon: 0.40, reset: false };
+
+    const existingUser = await User.findOne({mobile, role});
+    if(existingUser) return res.status(400).json({success:false,message:"User already exists"});
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const user = new User({
+      name,
+      mobile,
+      password: hashedPassword,
+      role,
+      extra: rest
+    });
+
+    await user.save();
+
+    const token = jwt.sign({id:user._id, role}, JWT_SECRET, {expiresIn: '7d'});
+
+    res.json({success:true, token, userId: user._id});
+  } catch(err) {
+    console.error(err);
+    res.status(500).json({success:false, message:"Server error"});
   }
+});
 
-  // Captcha wrong
-  return { coupon: 0.30, reset: false };
-}
+// ===== LOGIN =====
+app.post('/api/login', async (req, res) => {
+  try {
+    const {mobile, password, role} = req.body;
+    if(!mobile || !password || !role) {
+      return res.status(400).json({success:false,message:"Missing required fields"});
+    }
 
+    const user = await User.findOne({mobile, role});
+    if(!user) return res.status(404).json({success:false,message:"User not found"});
 
-// ---------------- Middleware ----------------
-function auth(req, res, next) {
+    const isMatch = await bcrypt.compare(password, user.password);
+    if(!isMatch) return res.status(401).json({success:false,message:"Incorrect password"});
+
+    const token = jwt.sign({id:user._id, role}, JWT_SECRET, {expiresIn:'7d'});
+    res.json({success:true, token, userId: user._id});
+  } catch(err) {
+    console.error(err);
+    res.status(500).json({success:false, message:"Server error"});
+  }
+});
+
+// ===== GET USER PROFILE =====
+app.get('/api/me', async (req, res) => {
   try {
     const token = req.headers.authorization?.split(" ")[1];
-    if (!token) return res.json({ success: false, msg: "Login required" });
+    if(!token) return res.status(401).json({success:false,message:"No token provided"});
 
-    req.user = jwt.verify(token, SECRET);
-    next();
-  } catch {
-    return res.json({ success: false, msg: "Invalid token" });
-  }
-}
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await User.findById(decoded.id).select('-password');
+    if(!user) return res.status(404).json({success:false,message:"User not found"});
 
-
-// ---------------- Signup ----------------
-app.post("/signup", async (req, res) => {
-  try {
-    const { name, mobile, password } = req.body;
-    let db = loadDB();
-
-    if (!db.users) db.users = {};
-    if (db.users[mobile])
-      return res.json({ success: false, msg: "Mobile already exists" });
-
-    db.users[mobile] = { name, password, wallet: 0 };
-    saveDB(db);
-
-    res.json({ success: true, msg: "Signup successful" });
-  } catch {
-    res.json({ success: false, msg: "Signup failed" });
+    res.json({success:true, user});
+  } catch(err) {
+    console.error(err);
+    res.status(401).json({success:false,message:"Invalid token"});
   }
 });
 
-
-// ---------------- Login ----------------
-app.post("/login", (req, res) => {
-  const { mobile, password } = req.body;
-  let db = loadDB();
-
-  if (!db.users[mobile] || db.users[mobile].password !== password)
-    return res.json({ success: false, msg: "Invalid login" });
-
-  const token = jwt.sign({ mobile }, SECRET);
-
-  res.json({
-    success: true,
-    msg: "Login successful",
-    token,
-    user: { mobile, name: db.users[mobile].name }
-  });
-});
-
-
-// ---------------- Get User (Wallet) ----------------
-app.post("/get-user", auth, (req, res) => {
-  let db = loadDB();
-  const user = db.users[req.user.mobile];
-
-  res.json({
-    success: true,
-    wallet: user.wallet,
-    counter: db.counter
-  });
-});
-
-
-// ---------------- PAY ₹1 ----------------
-app.post("/pay1", auth, async (req, res) => {
-  try {
-    const order = await razor.orders.create({
-      amount: 100,
-      currency: "INR",
-      receipt: "order_" + Date.now()
-    });
-
-    res.json({
-      success: true,
-      key: razor.key_id,
-      id: order.id,
-      amount: order.amount
-    });
-
-  } catch (err) {
-    console.error("Pay1 Error:", err);
-    res.json({ success: false, msg: "Order creation failed" });
-  }
-});
-
-
-// ---------------- Captcha Page ----------------
-app.get("/after-payment", (req, res) => {
-  res.sendFile(path.join(_dirname, "..", "public", "captcha.html"));
-});
-
-
-// ---------------- VERIFY PAYMENT + CAPTCHA + REWARD ----------------
-app.post('/verify', auth, async (req, res) => {
-    const { orderId, paymentId, signature, captchaStatus } = req.body;
-
-    try {
-        // 1. Verify signature
-        const expected_signature = crypto.createHmac("sha256", razor.key_secret)
-            .update(orderId + "|" + paymentId)
-            .digest("hex");
-
-        if (expected_signature !== signature) {
-            return res.json({ success: false, msg: "Invalid signature" });
-        }
-
-        // 2. Fetch payment status from Razorpay
-        const payment = await razor.payments.fetch(paymentId);
-        if (!payment || payment.status !== "captured") {
-            return res.json({ success: false, msg: "Payment not captured" });
-        }
-
-        // 3. Update DB & apply reward
-        let db = loadDB();
-        db.counter = db.counter ? db.counter + 1 : 1;
-
-        const couponResult = calculateCoupon(db.counter, captchaStatus);
-        db.users[req.user.mobile].wallet += couponResult.coupon;
-
-        if (couponResult.reset) db.counter = 0; // reset counter if milestone reached
-        saveDB(db);
-
-        res.json({
-            success: true,
-            msg: "Payment verified successfully",
-            prize: couponResult.coupon,
-            wallet: db.users[req.user.mobile].wallet
-        });
-
-    } catch (err) {
-        console.error("Verify Error:", err);
-        res.json({ success: false, msg: "Server error verifying payment" });
-    }
-});
-
-
-// ---------------- Withdraw ----------------
-app.post("/withdraw", auth, async (req, res) => {
-  try {
-    const { upi } = req.body;
-    let db = loadDB();
-    const user = db.users[req.user.mobile];
-    const amount = Number(user.wallet);
-
-    if (Number(amount) < 10.00)
-      return res.json({ success: false, msg: "Minimum withdraw ₹10.00 required" });
-
-    if (!upi)
-      return res.json({ success: false, msg: "UPI ID required" });
-
-    // Withdraw (RazorpayX)
-    const contact = await axios.post(
-      "https://api.razorpay.com/v1/contacts",
-      {
-        name: user.name,
-        email: req.user.mobile + "@example.com",
-        contact: req.user.mobile,
-        type: "customer"
-      },
-      { auth: { username: razor.key_id, password: razor.key_secret } }
-    );
-
-    const fundAcc = await axios.post(
-      "https://api.razorpay.com/v1/fund_accounts",
-      {
-        contact_id: contact.data.id,
-        account_type: "vpa",
-        vpa: { address: upi }
-      },
-      { auth: { username: razor.key_id, password: razor.key_secret } }
-    );
-
-    const payout = await axios.post(
-      "https://api.razorpay.com/v1/payouts",
-      {
-        account_number: "YOUR_RAZORPAYX_VIRTUAL_ACCOUNT",
-        fund_account_id: fundAcc.data.id,
-        amount: amount * 100,
-        currency: "INR",
-        mode: "UPI",
-        purpose: "withdrawal"
-      },
-      { auth: { username: razor.key_id, password: razor.key_secret } }
-    );
-
-    user.wallet = 0;
-    saveDB(db);
-
-    res.json({ success: true, msg: "Withdrawal initiated!", payout_id: payout.data.id });
-
-  } catch (err) {
-    console.log(err.response?.data || err);
-    res.json({ success: false, msg: "Withdrawal failed" });
-  }
-});
-
-
-// ---------------- Start Server ----------------
-app.listen(5000, () => console.log("Server running on 5000"));
+// ===== START SERVER =====
+app.listen(PORT, ()=>console.log(`Server running on port ${PORT} ✅`));
